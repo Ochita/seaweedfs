@@ -3,8 +3,10 @@ package mongodb
 import (
 	"context"
 	"fmt"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -19,6 +21,12 @@ func (store *MongodbStore) KvPut(ctx context.Context, key []byte, value []byte) 
 	opts := options.Update().SetUpsert(true)
 	filter := bson.D{{"directory", dir}, {"name", name}}
 	update := bson.D{{"$set", bson.D{{"meta", value}}}}
+
+	entry := &filer.Entry{}
+	err = entry.DecodeAttributesAndChunks(util.MaybeDecompressData(value))
+	if err == nil {
+		update = bson.D{{"$set", bson.D{{"meta", value}, {"mtime", entry.Attr.Mtime}}}}
+	}
 
 	_, err = c.UpdateOne(ctx, filter, update, opts)
 

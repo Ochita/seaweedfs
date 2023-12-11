@@ -3,6 +3,8 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -10,7 +12,6 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"time"
 )
 
 func init() {
@@ -114,7 +115,7 @@ func (store *MongodbStore) UpdateEntry(ctx context.Context, entry *filer.Entry) 
 
 	opts := options.Update().SetUpsert(true)
 	filter := bson.D{{"directory", dir}, {"name", name}}
-	update := bson.D{{"$set", bson.D{{"meta", meta}}}}
+	update := bson.D{{"$set", bson.D{{"meta", meta}, {"mtime", entry.Attr.Mtime}}}}
 
 	_, err = c.UpdateOne(ctx, filter, update, opts)
 
