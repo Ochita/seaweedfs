@@ -63,7 +63,7 @@ func (f *Filer) NotifyUpdateEvent(ctx context.Context, oldEntry, newEntry *Entry
 		}
 	}
 
-	f.logMetaEvent(ctx, fullpath, eventNotification)
+	// f.logMetaEvent(ctx, fullpath, eventNotification)
 
 }
 
