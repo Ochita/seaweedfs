@@ -29,6 +29,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/shell"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
@@ -38,10 +39,11 @@ const (
 )
 
 type MasterOption struct {
-	Master            pb.ServerAddress
-	MetaFolder        string
-	VolumeSizeLimitMB uint32
-	VolumePreallocate bool
+	Master                     pb.ServerAddress
+	MetaFolder                 string
+	VolumeSizeLimitMB          uint32
+	VolumePreallocate          bool
+	MaxParallelVacuumPerServer int
 	// PulseSeconds            int
 	DefaultReplicaPlacement string
 	GarbageThreshold        float64
@@ -59,9 +61,9 @@ type MasterServer struct {
 
 	preallocateSize int64
 
-	Topo *topology.Topology
-	vg   *topology.VolumeGrowth
-	vgCh chan *topology.VolumeGrowRequest
+	Topo                    *topology.Topology
+	vg                      *topology.VolumeGrowth
+	volumeGrowthRequestChan chan *topology.VolumeGrowRequest
 
 	boundedLeaderChan chan int
 
@@ -92,11 +94,16 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	v.SetDefault("master.replication.treat_replication_as_minimums", false)
 	replicationAsMin := v.GetBool("master.replication.treat_replication_as_minimums")
 
-	v.SetDefault("master.volume_growth.copy_1", 7)
-	v.SetDefault("master.volume_growth.copy_2", 6)
-	v.SetDefault("master.volume_growth.copy_3", 3)
-	v.SetDefault("master.volume_growth.copy_other", 1)
-	v.SetDefault("master.volume_growth.threshold", 0.9)
+	v.SetDefault("master.volume_growth.copy_1", topology.VolumeGrowStrategy.Copy1Count)
+	v.SetDefault("master.volume_growth.copy_2", topology.VolumeGrowStrategy.Copy2Count)
+	v.SetDefault("master.volume_growth.copy_3", topology.VolumeGrowStrategy.Copy3Count)
+	v.SetDefault("master.volume_growth.copy_other", topology.VolumeGrowStrategy.CopyOtherCount)
+	v.SetDefault("master.volume_growth.threshold", topology.VolumeGrowStrategy.Threshold)
+	topology.VolumeGrowStrategy.Copy1Count = v.GetUint32("master.volume_growth.copy_1")
+	topology.VolumeGrowStrategy.Copy2Count = v.GetUint32("master.volume_growth.copy_2")
+	topology.VolumeGrowStrategy.Copy3Count = v.GetUint32("master.volume_growth.copy_3")
+	topology.VolumeGrowStrategy.CopyOtherCount = v.GetUint32("master.volume_growth.copy_other")
+	topology.VolumeGrowStrategy.Threshold = v.GetFloat64("master.volume_growth.threshold")
 
 	var preallocateSize int64
 	if option.VolumePreallocate {
@@ -105,14 +112,14 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 
 	grpcDialOption := security.LoadClientTLS(v, "grpc.master")
 	ms := &MasterServer{
-		option:          option,
-		preallocateSize: preallocateSize,
-		vgCh:            make(chan *topology.VolumeGrowRequest, 1<<6),
-		clientChans:     make(map[string]chan *master_pb.KeepConnectedResponse),
-		grpcDialOption:  grpcDialOption,
-		MasterClient:    wdclient.NewMasterClient(grpcDialOption, "", cluster.MasterType, option.Master, "", "", *pb.NewServiceDiscoveryFromMap(peers)),
-		adminLocks:      NewAdminLocks(),
-		Cluster:         cluster.NewCluster(),
+		option:                  option,
+		preallocateSize:         preallocateSize,
+		volumeGrowthRequestChan: make(chan *topology.VolumeGrowRequest, 1<<6),
+		clientChans:             make(map[string]chan *master_pb.KeepConnectedResponse),
+		grpcDialOption:          grpcDialOption,
+		MasterClient:            wdclient.NewMasterClient(grpcDialOption, "", cluster.MasterType, option.Master, "", "", *pb.NewServiceDiscoveryFromMap(peers)),
+		adminLocks:              NewAdminLocks(),
+		Cluster:                 cluster.NewCluster(),
 	}
 	ms.boundedLeaderChan = make(chan int, 16)
 
@@ -140,6 +147,7 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 		r.HandleFunc("/vol/status", ms.proxyToLeader(ms.guard.WhiteList(ms.volumeStatusHandler)))
 		r.HandleFunc("/vol/vacuum", ms.proxyToLeader(ms.guard.WhiteList(ms.volumeVacuumHandler)))
 		r.HandleFunc("/submit", ms.guard.WhiteList(ms.submitFromMasterServerHandler))
+		r.HandleFunc("/collection/info", ms.guard.WhiteList(ms.collectionInfoHandler))
 		/*
 			r.HandleFunc("/stats/health", ms.guard.WhiteList(statsHealthHandler))
 			r.HandleFunc("/stats/counter", ms.guard.WhiteList(statsCounterHandler))
@@ -151,7 +159,8 @@ func NewMasterServer(r *mux.Router, option *MasterOption, peers map[string]pb.Se
 	ms.Topo.StartRefreshWritableVolumes(
 		ms.grpcDialOption,
 		ms.option.GarbageThreshold,
-		v.GetFloat64("master.volume_growth.threshold"),
+		ms.option.MaxParallelVacuumPerServer,
+		topology.VolumeGrowStrategy.Threshold,
 		ms.preallocateSize,
 	)
 
@@ -180,22 +189,7 @@ func (ms *MasterServer) SetRaftServer(raftServer *RaftServer) {
 		raftServerName = fmt.Sprintf("[%s]", ms.Topo.RaftServer.Name())
 	} else if raftServer.RaftHashicorp != nil {
 		ms.Topo.HashicorpRaft = raftServer.RaftHashicorp
-		leaderCh := raftServer.RaftHashicorp.LeaderCh()
-		prevLeader, _ := ms.Topo.HashicorpRaft.LeaderWithID()
 		raftServerName = ms.Topo.HashicorpRaft.String()
-		go func() {
-			for {
-				select {
-				case isLeader := <-leaderCh:
-					ms.Topo.RaftServerAccessLock.RLock()
-					leader, _ := ms.Topo.HashicorpRaft.LeaderWithID()
-					ms.Topo.RaftServerAccessLock.RUnlock()
-					glog.V(0).Infof("is leader %+v change event: %+v => %+v", isLeader, prevLeader, leader)
-					stats.MasterLeaderChangeCounter.WithLabelValues(fmt.Sprintf("%+v", leader)).Inc()
-					prevLeader = leader
-				}
-			}
-		}()
 	}
 	ms.Topo.RaftServerAccessLock.Unlock()
 
@@ -251,7 +245,7 @@ func (ms *MasterServer) proxyToLeader(f http.HandlerFunc) http.HandlerFunc {
 			}
 			director(req)
 		}
-		proxy.Transport = util.Transport
+		proxy.Transport = util_http.GetGlobalHttpClient().GetClientTransport()
 		proxy.ServeHTTP(w, r)
 	}
 }
@@ -287,12 +281,12 @@ func (ms *MasterServer) startAdminScripts() {
 
 	reg, _ := regexp.Compile(`'.*?'|".*?"|\S+`)
 
-	go commandEnv.MasterClient.KeepConnectedToMaster()
+	go commandEnv.MasterClient.KeepConnectedToMaster(context.Background())
 
 	go func() {
 		for {
 			time.Sleep(time.Duration(sleepMinutes) * time.Minute)
-			if ms.Topo.IsLeader() && ms.MasterClient.GetMaster() != "" {
+			if ms.Topo.IsLeader() && ms.MasterClient.GetMaster(context.Background()) != "" {
 				shellOptions.FilerAddress = ms.GetOneFiler(cluster.FilerGroupName(*shellOptions.FilerGroup))
 				if shellOptions.FilerAddress == "" {
 					continue
@@ -320,6 +314,10 @@ func processEachCmd(reg *regexp.Regexp, line string, commandEnv *shell.CommandEn
 
 	for _, c := range shell.Commands {
 		if c.Name() == cmd {
+			if c.HasTag(shell.ResourceHeavy) {
+				glog.Warningf("%s is resource heavy and should not run on master", cmd)
+				continue
+			}
 			glog.V(0).Infof("executing: %s %v", cmd, args)
 			if err := c.Do(args, commandEnv, os.Stdout); err != nil {
 				glog.V(0).Infof("error: %v", err)
@@ -342,6 +340,8 @@ func (ms *MasterServer) createSequencer(option *MasterOption) sequence.Sequencer
 			glog.Error(err)
 			seq = nil
 		}
+	case "raft":
+		fallthrough
 	default:
 		seq = sequence.NewMemorySequencer()
 	}

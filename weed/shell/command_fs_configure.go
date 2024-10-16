@@ -46,6 +46,10 @@ func (c *commandFsConfigure) Help() string {
 `
 }
 
+func (c *commandFsConfigure) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	fsConfigureCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -56,6 +60,8 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	diskType := fsConfigureCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	fsync := fsConfigureCommand.Bool("fsync", false, "fsync for the writes")
 	isReadOnly := fsConfigureCommand.Bool("readOnly", false, "disable writes")
+	worm := fsConfigureCommand.Bool("worm", false, "worm mode, If true, a file can only be changed once, after which it becomes readonly and undeletable, see https://en.wikipedia.org/wiki/Write_once_read_many")
+	maxFileNameLength := fsConfigureCommand.Uint("maxFileNameLength", 0, "file name length limits in bytes for compatibility with Unix-based systems")
 	dataCenter := fsConfigureCommand.String("dataCenter", "", "assign writes to this dataCenter")
 	rack := fsConfigureCommand.String("rack", "", "assign writes to this rack")
 	dataNode := fsConfigureCommand.String("dataNode", "", "assign writes to this dataNode")
@@ -79,12 +85,14 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			Replication:       *replication,
 			Ttl:               *ttl,
 			Fsync:             *fsync,
+			MaxFileNameLength: uint32(*maxFileNameLength),
 			DiskType:          *diskType,
 			VolumeGrowthCount: uint32(*volumeGrowthCount),
 			ReadOnly:          *isReadOnly,
 			DataCenter:        *dataCenter,
 			Rack:              *rack,
 			DataNode:          *dataNode,
+			Worm:              *worm,
 		}
 
 		// check collection

@@ -8,6 +8,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"golang.org/x/exp/slices"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"io"
 )
@@ -35,6 +37,10 @@ func (c *commandVolumeList) Help() string {
 	This command list all volumes as a tree of dataCenter > rack > dataNode > volume.
 
 `
+}
+
+func (c *commandVolumeList) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandVolumeList) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -81,8 +87,8 @@ func diskInfoToString(diskInfo *master_pb.DiskInfo) string {
 
 func (c *commandVolumeList) writeTopologyInfo(writer io.Writer, t *master_pb.TopologyInfo, volumeSizeLimitMb uint64, verbosityLevel int) statistics {
 	output(verbosityLevel >= 0, writer, "Topology volumeSizeLimit:%d MB%s\n", volumeSizeLimitMb, diskInfosToString(t.DiskInfos))
-	slices.SortFunc(t.DataCenterInfos, func(a, b *master_pb.DataCenterInfo) bool {
-		return a.Id < b.Id
+	slices.SortFunc(t.DataCenterInfos, func(a, b *master_pb.DataCenterInfo) int {
+		return strings.Compare(a.Id, b.Id)
 	})
 	var s statistics
 	for _, dc := range t.DataCenterInfos {
@@ -98,8 +104,8 @@ func (c *commandVolumeList) writeTopologyInfo(writer io.Writer, t *master_pb.Top
 func (c *commandVolumeList) writeDataCenterInfo(writer io.Writer, t *master_pb.DataCenterInfo, verbosityLevel int) statistics {
 	output(verbosityLevel >= 1, writer, "  DataCenter %s%s\n", t.Id, diskInfosToString(t.DiskInfos))
 	var s statistics
-	slices.SortFunc(t.RackInfos, func(a, b *master_pb.RackInfo) bool {
-		return a.Id < b.Id
+	slices.SortFunc(t.RackInfos, func(a, b *master_pb.RackInfo) int {
+		return strings.Compare(a.Id, b.Id)
 	})
 	for _, r := range t.RackInfos {
 		if *c.rack != "" && *c.rack != r.Id {
@@ -114,8 +120,8 @@ func (c *commandVolumeList) writeDataCenterInfo(writer io.Writer, t *master_pb.D
 func (c *commandVolumeList) writeRackInfo(writer io.Writer, t *master_pb.RackInfo, verbosityLevel int) statistics {
 	output(verbosityLevel >= 2, writer, "    Rack %s%s\n", t.Id, diskInfosToString(t.DiskInfos))
 	var s statistics
-	slices.SortFunc(t.DataNodeInfos, func(a, b *master_pb.DataNodeInfo) bool {
-		return a.Id < b.Id
+	slices.SortFunc(t.DataNodeInfos, func(a, b *master_pb.DataNodeInfo) int {
+		return strings.Compare(a.Id, b.Id)
 	})
 	for _, dn := range t.DataNodeInfos {
 		if *c.dataNode != "" && *c.dataNode != dn.Id {
@@ -159,8 +165,8 @@ func (c *commandVolumeList) writeDiskInfo(writer io.Writer, t *master_pb.DiskInf
 		diskType = "hdd"
 	}
 	output(verbosityLevel >= 4, writer, "        Disk %s(%s)\n", diskType, diskInfoToString(t))
-	slices.SortFunc(t.VolumeInfos, func(a, b *master_pb.VolumeInformationMessage) bool {
-		return a.Id < b.Id
+	slices.SortFunc(t.VolumeInfos, func(a, b *master_pb.VolumeInformationMessage) int {
+		return int(a.Id - b.Id)
 	})
 	for _, vi := range t.VolumeInfos {
 		if c.isNotMatchDiskInfo(vi.ReadOnly, vi.Collection, vi.Id) {
@@ -172,7 +178,13 @@ func (c *commandVolumeList) writeDiskInfo(writer io.Writer, t *master_pb.DiskInf
 		if c.isNotMatchDiskInfo(false, ecShardInfo.Collection, ecShardInfo.Id) {
 			continue
 		}
-		output(verbosityLevel >= 5, writer, "          ec volume id:%v collection:%v shards:%v\n", ecShardInfo.Id, ecShardInfo.Collection, erasure_coding.ShardBits(ecShardInfo.EcIndexBits).ShardIds())
+
+		var destroyTimeDisplay string
+		destroyTime := ecShardInfo.DestroyTime
+		if destroyTime > 0 {
+			destroyTimeDisplay = time.Unix(int64(destroyTime), 0).Format("2006-01-02 15:04:05")
+		}
+		output(verbosityLevel >= 5, writer, "          ec volume id:%v collection:%v shards:%v destroyTime:%s\n", ecShardInfo.Id, ecShardInfo.Collection, erasure_coding.ShardBits(ecShardInfo.EcIndexBits).ShardIds(), destroyTimeDisplay)
 	}
 	output(verbosityLevel >= 4, writer, "        Disk %s %+v \n", diskType, s)
 	return s

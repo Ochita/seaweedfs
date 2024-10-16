@@ -8,6 +8,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"google.golang.org/grpc"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -16,8 +18,10 @@ type FilerBackupOptions struct {
 	filer           *string
 	path            *string
 	excludePaths    *string
+	excludeFileName *string
 	debug           *bool
 	proxyByFiler    *bool
+	doDeleteFiles   *bool
 	timeAgo         *time.Duration
 	retentionDays   *int
 }
@@ -31,11 +35,12 @@ func init() {
 	filerBackupOptions.filer = cmdFilerBackup.Flag.String("filer", "localhost:8888", "filer of one SeaweedFS cluster")
 	filerBackupOptions.path = cmdFilerBackup.Flag.String("filerPath", "/", "directory to sync on filer")
 	filerBackupOptions.excludePaths = cmdFilerBackup.Flag.String("filerExcludePaths", "", "exclude directories to sync on filer")
+	filerBackupOptions.excludeFileName = cmdFilerBackup.Flag.String("filerExcludeFileName", "", "exclude file names that match the regexp to sync on filer")
 	filerBackupOptions.proxyByFiler = cmdFilerBackup.Flag.Bool("filerProxy", false, "read and write file chunks by filer instead of volume servers")
+	filerBackupOptions.doDeleteFiles = cmdFilerBackup.Flag.Bool("doDeleteFiles", false, "delete files on the destination")
 	filerBackupOptions.debug = cmdFilerBackup.Flag.Bool("debug", false, "debug mode to print out received files")
 	filerBackupOptions.timeAgo = cmdFilerBackup.Flag.Duration("timeAgo", 0, "start time before now. \"300ms\", \"1.5h\" or \"2h45m\". Valid time units are \"ns\", \"us\" (or \"µs\"), \"ms\", \"s\", \"m\", \"h\"")
 	filerBackupOptions.retentionDays = cmdFilerBackup.Flag.Int("retentionDays", 0, "incremental backup retention days")
-
 }
 
 var cmdFilerBackup = &Command{
@@ -54,7 +59,7 @@ var cmdFilerBackup = &Command{
 
 func runFilerBackup(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	util.LoadConfiguration("replication", true)
 
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
@@ -81,8 +86,7 @@ const (
 func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOptions, clientId int32, clientEpoch int32) error {
 
 	// find data sink
-	config := util.GetViper()
-	dataSink := findSink(config)
+	dataSink := findSink(util.GetViper())
 	if dataSink == nil {
 		return fmt.Errorf("no data sink configured in replication.toml")
 	}
@@ -90,6 +94,13 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 	sourceFiler := pb.ServerAddress(*backupOption.filer)
 	sourcePath := *backupOption.path
 	excludePaths := util.StringSplit(*backupOption.excludePaths, ",")
+	var reExcludeFileName *regexp.Regexp
+	if *backupOption.excludeFileName != "" {
+		var err error
+		if reExcludeFileName, err = regexp.Compile(*backupOption.excludeFileName); err != nil {
+			return fmt.Errorf("error compile regexp %v for exclude file name: %+v", *backupOption.excludeFileName, err)
+		}
+	}
 	timeAgo := *backupOption.timeAgo
 	targetPath := dataSink.GetSinkToDirectory()
 	debug := *backupOption.debug
@@ -119,7 +130,7 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		*backupOption.proxyByFiler)
 	dataSink.SetSourceFiler(filerSource)
 
-	processEventFn := genProcessFunction(sourcePath, targetPath, excludePaths, dataSink, debug)
+	processEventFn := genProcessFunction(sourcePath, targetPath, excludePaths, reExcludeFileName, dataSink, *backupOption.doDeleteFiles, debug)
 
 	processEventFnWithOffset := pb.AddOffsetFunc(processEventFn, 3*time.Second, func(counter int64, lastTsNs int64) error {
 		glog.V(0).Infof("backup %s progressed to %v %0.2f/sec", sourceFiler, time.Unix(0, lastTsNs), float64(counter)/float64(3))
@@ -138,17 +149,22 @@ func doFilerBackup(grpcDialOption grpc.DialOption, backupOption *FilerBackupOpti
 		}()
 	}
 
+	prefix := sourcePath
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
 	metadataFollowOption := &pb.MetadataFollowOption{
 		ClientName:             "backup_" + dataSink.GetName(),
 		ClientId:               clientId,
 		ClientEpoch:            clientEpoch,
 		SelfSignature:          0,
-		PathPrefix:             sourcePath,
+		PathPrefix:             prefix,
 		AdditionalPathPrefixes: nil,
 		DirectoriesToWatch:     nil,
 		StartTsNs:              startFrom.UnixNano(),
 		StopTsNs:               0,
-		EventErrorType:         pb.TrivialOnError,
+		EventErrorType:         pb.RetryForeverOnError,
 	}
 
 	return pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)

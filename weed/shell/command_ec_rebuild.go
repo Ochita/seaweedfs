@@ -55,6 +55,10 @@ func (c *commandEcRebuild) Help() string {
 `
 }
 
+func (c *commandEcRebuild) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandEcRebuild) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	fixCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -224,7 +228,7 @@ func prepareDataToRecover(commandEnv *CommandEnv, rebuilder *EcNode, collection 
 					Collection:     collection,
 					ShardIds:       []uint32{uint32(shardId)},
 					CopyEcxFile:    needEcxFile,
-					CopyEcjFile:    needEcxFile,
+					CopyEcjFile:    true,
 					CopyVifFile:    needEcxFile,
 					SourceDataNode: ecNodes[0].info.Id,
 				})

@@ -50,7 +50,7 @@ func (s *Store) CollectErasureCodingHeartbeat() *master_pb.Heartbeat {
 
 func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId erasure_coding.ShardId) error {
 	for _, location := range s.Locations {
-		if err := location.LoadEcShard(collection, vid, shardId); err == nil {
+		if ecVolume, err := location.LoadEcShard(collection, vid, shardId); err == nil {
 			glog.V(0).Infof("MountEcShards %d.%d", vid, shardId)
 
 			var shardBits erasure_coding.ShardBits
@@ -60,6 +60,7 @@ func (s *Store) MountEcShards(collection string, vid needle.VolumeId, shardId er
 				Collection:  collection,
 				EcIndexBits: uint32(shardBits.AddShardId(shardId)),
 				DiskType:    string(location.DiskType),
+				DestroyTime: ecVolume.DestroyTime,
 			}
 			return nil
 		} else if err == os.ErrNotExist {
@@ -400,8 +401,8 @@ func (s *Store) EcVolumes() (ecVolumes []*erasure_coding.EcVolume) {
 		}
 		location.ecVolumesLock.RUnlock()
 	}
-	slices.SortFunc(ecVolumes, func(a, b *erasure_coding.EcVolume) bool {
-		return a.VolumeId > b.VolumeId
+	slices.SortFunc(ecVolumes, func(a, b *erasure_coding.EcVolume) int {
+		return int(b.VolumeId - a.VolumeId)
 	})
 	return ecVolumes
 }
